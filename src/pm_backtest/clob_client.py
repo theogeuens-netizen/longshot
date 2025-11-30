@@ -1,8 +1,4 @@
-"""Polymarket CLOB API client for fetching price history - Alternative Version.
-
-This version uses the 'interval' parameter instead of startTs/endTs,
-which may be more reliable for some market types.
-"""
+"""Polymarket CLOB API client for fetching price history."""
 
 import asyncio
 import json
@@ -33,9 +29,6 @@ class CLOBClient:
         self.semaphore = asyncio.Semaphore(config.max_concurrent_requests)
         self.cache_dir = Path("data/raw/prices")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Track which parameter format works
-        self._working_param_format: Optional[str] = None
 
     async def __aenter__(self):
         """Enter async context."""
@@ -54,43 +47,6 @@ class CLOBClient:
         """Get cache file path for price data."""
         return self.cache_dir / f"{token_id}_{snapshot_ts}.json"
 
-    def _build_params(self, token_id: str, start_ts: int, end_ts: int, fidelity: int, format_type: str = "auto") -> dict:
-        """Build request parameters based on format type."""
-        
-        # If we found a working format before, use it
-        if format_type == "auto" and self._working_param_format:
-            format_type = self._working_param_format
-        
-        if format_type == "token_id":
-            return {
-                "token_id": token_id,
-                "startTs": start_ts,
-                "endTs": end_ts,
-                "fidelity": fidelity,
-            }
-        elif format_type == "tokenId":
-            return {
-                "tokenId": token_id,
-                "startTs": start_ts,
-                "endTs": end_ts,
-                "fidelity": fidelity,
-            }
-        elif format_type == "interval":
-            # Use interval approach (gets last 1 month of data)
-            return {
-                "token_id": token_id,
-                "interval": "1m",  # 1 month
-                "fidelity": fidelity,
-            }
-        else:
-            # Default: try token_id first
-            return {
-                "token_id": token_id,
-                "startTs": start_ts,
-                "endTs": end_ts,
-                "fidelity": fidelity,
-            }
-
     async def fetch_price_history(
         self,
         token_id: str,
@@ -103,7 +59,7 @@ class CLOBClient:
         Fetch price history for a token from CLOB API.
 
         Args:
-            token_id: CLOB token ID
+            token_id: CLOB token ID (decimal string from clobTokenIds)
             start_ts: Start timestamp (UNIX seconds)
             end_ts: End timestamp (UNIX seconds)
             fidelity: Data granularity in minutes (default 60 = hourly)
@@ -115,12 +71,12 @@ class CLOBClient:
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         cache_path = self._get_cache_path(token_id, end_ts)
 
-        # Try cache first
+        # 1) Try cache first
         if use_cache and cache_path.exists():
             try:
                 with open(cache_path) as f:
                     raw_history = json.load(f)
-                # Handle both response formats from cache
+
                 if isinstance(raw_history, dict) and "history" in raw_history:
                     history_data = raw_history["history"]
                 elif isinstance(raw_history, list):
@@ -129,94 +85,84 @@ class CLOBClient:
                     history_data = []
 
                 if history_data:
-                    return [PricePoint(t=p["t"], p=p["p"]) for p in history_data]
+                    points = [PricePoint(t=p["t"], p=p["p"]) for p in history_data]
+                    return sorted(points, key=lambda x: x.timestamp)
             except Exception:
-                pass  # Fall through to API fetch
+                # Ignore cache issues and fall through to live fetch
+                pass
 
-        # Fetch from API
+        # 2) Fetch from API
         async with self.semaphore:
             await asyncio.sleep(self.config.base_sleep_seconds)
 
-            # Try multiple parameter formats if we don't know which works yet
-            formats_to_try = ["token_id", "tokenId", "interval"] if not self._working_param_format else [self._working_param_format]
+            # IMPORTANT: use 'market' param, not token_id / tokenId
+            params = {
+                "market": token_id,
+                "startTs": start_ts,
+                "endTs": end_ts,
+                "fidelity": fidelity,
+            }
 
-            for fmt in formats_to_try:
-                params = self._build_params(token_id, start_ts, end_ts, fidelity, fmt)
-                
-                @retry(
-                    retry=retry_if_exception_type((httpx.TimeoutException,)),
-                    wait=wait_exponential(multiplier=1, min=1, max=16),
-                    stop=stop_after_attempt(self.config.max_retries),
-                    reraise=True,
+            @retry(
+                retry=retry_if_exception_type((httpx.TimeoutException,)),
+                wait=wait_exponential(multiplier=1, min=1, max=16),
+                stop=stop_after_attempt(self.config.max_retries),
+                reraise=True,
+            )
+            async def _make_request():
+                response = await self.client.get(
+                    f"{self.base_url}/prices-history", params=params
                 )
-                async def _make_request():
-                    response = await self.client.get(
-                        f"{self.base_url}/prices-history", params=params
+
+                # Rate limiting
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", 5))
+                    await asyncio.sleep(retry_after)
+                    response.raise_for_status()
+
+                response.raise_for_status()
+                return response
+
+            try:
+                response = await _make_request()
+            except httpx.TimeoutException:
+                print(f"⚠️  Timeout fetching prices for {token_id}", file=sys.stderr)
+                return []
+            except httpx.HTTPStatusError as e:
+                # 404 = no data; 400 = invalid market id (nothing we can do)
+                if e.response.status_code not in (400, 404):
+                    print(
+                        f"⚠️  HTTP error fetching prices for {token_id}: "
+                        f"{e.response.status_code}",
+                        file=sys.stderr,
                     )
+                return []
+            except Exception as e:
+                print(f"⚠️  Unexpected error fetching prices for {token_id}: {e}", file=sys.stderr)
+                return []
 
-                    # Handle rate limiting
-                    if response.status_code == 429:
-                        retry_after = int(response.headers.get("Retry-After", 5))
-                        await asyncio.sleep(retry_after)
-                        response.raise_for_status()
+            raw_history = response.json()
 
-                    return response
+            if isinstance(raw_history, dict) and "history" in raw_history:
+                history_data = raw_history["history"]
+            elif isinstance(raw_history, list):
+                history_data = raw_history
+            else:
+                history_data = []
 
+            # Cache raw response
+            if use_cache:
                 try:
-                    response = await _make_request()
-                    
-                    if response.status_code == 200:
-                        raw_history = response.json()
-                        
-                        # Remember this working format
-                        if not self._working_param_format:
-                            self._working_param_format = fmt
-                            print(f"✓ Found working API format: {fmt}")
-                        
-                        # Cache the result
-                        if use_cache:
-                            try:
-                                with open(cache_path, "w") as f:
-                                    json.dump(raw_history, f)
-                            except Exception:
-                                pass
+                    with open(cache_path, "w") as f:
+                        json.dump(raw_history, f)
+                except Exception:
+                    pass
 
-                        # Parse into PricePoint objects
-                        if isinstance(raw_history, dict) and "history" in raw_history:
-                            history_data = raw_history["history"]
-                        elif isinstance(raw_history, list):
-                            history_data = raw_history
-                        else:
-                            return []
+            if not history_data:
+                return []
 
-                        if history_data:
-                            price_points = [PricePoint(t=p["t"], p=p["p"]) for p in history_data]
-                            return sorted(price_points, key=lambda x: x.timestamp)
-                        else:
-                            return []
-                    
-                    elif response.status_code == 400:
-                        # Try next format
-                        continue
-                    elif response.status_code == 404:
-                        # Token has no data - no point trying other formats
-                        return []
-                    else:
-                        # Other error - try next format
-                        continue
-
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code in (400, 404):
-                        continue
-                    # Other HTTP errors
-                    continue
-                except httpx.TimeoutException:
-                    continue
-                except Exception as e:
-                    continue
-
-            # All formats failed - token likely has no price history
-            return []
+            points = [PricePoint(t=p["t"], p=p["p"]) for p in history_data]
+            return sorted(points, key=lambda x: x.timestamp)
 
     def get_snapshot_price(
         self, price_history: list[PricePoint], snapshot_time: datetime
@@ -234,12 +180,11 @@ class CLOBClient:
         if not price_history:
             return None
 
-        # Find the last price at or before snapshot_time
+        # Last price at or before snapshot_time
         valid_prices = [p for p in price_history if p.timestamp <= snapshot_time]
 
         if not valid_prices:
-            # If no price before snapshot, try to get the nearest after
-            # (within a small tolerance, e.g., 1 hour)
+            # If nothing before, allow a small window after (e.g. 1 hour)
             tolerance = timedelta(hours=1)
             valid_prices = [
                 p
@@ -250,8 +195,10 @@ class CLOBClient:
         if not valid_prices:
             return None
 
-        # Return the price closest to snapshot_time
-        closest = min(valid_prices, key=lambda p: abs((p.timestamp - snapshot_time).total_seconds()))
+        closest = min(
+            valid_prices,
+            key=lambda p: abs((p.timestamp - snapshot_time).total_seconds()),
+        )
         return closest.price
 
     async def get_market_snapshot_prices(
@@ -267,45 +214,46 @@ class CLOBClient:
         Returns:
             Tuple of (yes_price, no_price), either may be None if data unavailable
         """
-        # Get YES token ID
+        # Get YES token ID index
         yes_idx = market.get_yes_index()
         if yes_idx is None or yes_idx >= len(market.clob_token_ids):
             return None, None
 
         yes_token_id = market.clob_token_ids[yes_idx]
-        
-        # Validate token ID - skip if empty or invalid
-        if not yes_token_id or len(yes_token_id) < 10:
+
+        # Basic sanity check on token id
+        if not yes_token_id or len(str(yes_token_id)) < 10:
             return None, None
 
-        # Calculate time window for price fetch
+        # Time window for price fetch
         window_start = snapshot_time - timedelta(hours=self.config.window_hours)
-        window_end = snapshot_time + timedelta(hours=1)  # Small buffer after
+        window_end = snapshot_time + timedelta(hours=1)  # small buffer after
 
-        # Clamp to market start date if available
+        # Clamp to market start date if we have it
         if market.start_date and window_start < market.start_date:
             window_start = market.start_date
 
-        # Fetch YES price history
         start_ts = int(window_start.timestamp())
         end_ts = int(window_end.timestamp())
 
         try:
-            yes_history = await self.fetch_price_history(yes_token_id, start_ts, end_ts)
+            yes_history = await self.fetch_price_history(
+                str(yes_token_id), start_ts, end_ts
+            )
             yes_price = self.get_snapshot_price(yes_history, snapshot_time)
 
             if yes_price is None:
                 return None, None
 
-            # Derive NO price from YES price
+            # Derive NO as 1 - YES
             no_price = 1.0 - yes_price
 
-            # Clamp to valid range [0, 1]
+            # Clamp to [0, 1]
             yes_price = max(0.0, min(1.0, yes_price))
             no_price = max(0.0, min(1.0, no_price))
 
             return yes_price, no_price
 
-        except Exception as e:
-            # Silently return None for failures
+        except Exception:
+            # On any error, just signal missing data
             return None, None
