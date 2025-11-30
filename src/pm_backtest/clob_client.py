@@ -76,7 +76,16 @@ class CLOBClient:
             try:
                 with open(cache_path) as f:
                     raw_history = json.load(f)
-                return [PricePoint(t=p["t"], p=p["p"]) for p in raw_history]
+                # Handle both response formats from cache
+                if isinstance(raw_history, dict) and "history" in raw_history:
+                    history_data = raw_history["history"]
+                elif isinstance(raw_history, list):
+                    history_data = raw_history
+                else:
+                    history_data = []
+
+                if history_data:
+                    return [PricePoint(t=p["t"], p=p["p"]) for p in history_data]
             except Exception:
                 pass  # Fall through to API fetch
 
@@ -85,7 +94,7 @@ class CLOBClient:
             await asyncio.sleep(self.config.base_sleep_seconds)
 
             params = {
-                "market": token_id,
+                "tokenID": token_id,
                 "startTs": start_ts,
                 "endTs": end_ts,
                 "fidelity": fidelity,
@@ -123,8 +132,16 @@ class CLOBClient:
                         pass  # Silently ignore cache failures
 
                 # Parse into PricePoint objects
-                if isinstance(raw_history, list):
-                    price_points = [PricePoint(t=p["t"], p=p["p"]) for p in raw_history]
+                # Handle both response formats: {"history": [...]} or [...]
+                if isinstance(raw_history, dict) and "history" in raw_history:
+                    history_data = raw_history["history"]
+                elif isinstance(raw_history, list):
+                    history_data = raw_history
+                else:
+                    return []
+
+                if history_data:
+                    price_points = [PricePoint(t=p["t"], p=p["p"]) for p in history_data]
                     return sorted(price_points, key=lambda x: x.timestamp)
                 else:
                     return []
