@@ -1,0 +1,48 @@
+# Polymarket Longshot Bias Backtest Configuration
+
+# API endpoints (from Polymarket docs)
+gamma_base_url: "https://gamma-api.polymarket.com"
+clob_base_url: "https://clob.polymarket.com"
+
+# Backtest parameters
+backtest:
+  # Days before market resolution to take price snapshot
+  lookback_days: 7
+
+  # Hours of price history to fetch around snapshot time
+  window_hours: 24
+
+  # Longshot threshold: if either YES or NO price is in this range, it's a longshot
+  longshot_min: 0.01   # 1% minimum
+  longshot_max: 0.10   # 10% maximum
+
+  # Minimum market quality filters
+  min_liquidity: 1000    # minimum liquidityNum
+  min_volume: 5000       # minimum volumeNum
+
+  # Date range for backtest (market end dates)
+  start_end_date: "2025-04-01T00:00:00Z"
+  end_end_date: "2025-11-01T00:00:00Z"
+
+  # Fee placeholder (not implemented yet, but reserved for future use)
+  # fee_bps: 0  # basis points, e.g., 10 = 0.1% fee
+
+# API settings
+api:
+  # Maximum concurrent requests to avoid overwhelming API
+  max_concurrent_requests: 3
+
+  # Request timeout in seconds
+  request_timeout_seconds: 15
+
+  # Sleep between requests (seconds) to be polite
+  base_sleep_seconds: 0.2
+
+  # Maximum retry attempts for failed requests
+  max_retries: 5
+
+  # Use cached data if available (set to false to force fresh fetch)
+  use_cache: true
+
+  # Gamma markets pagination limit
+  gamma_page_limit: 100
