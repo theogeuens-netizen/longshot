@@ -94,7 +94,7 @@ class CLOBClient:
             await asyncio.sleep(self.config.base_sleep_seconds)
 
             params = {
-                "tokenID": token_id,
+                "tokenId": token_id,
                 "startTs": start_ts,
                 "endTs": end_ts,
                 "fidelity": fidelity,
