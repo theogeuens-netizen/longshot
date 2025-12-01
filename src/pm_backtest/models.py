@@ -1,6 +1,6 @@
 """Data models for Polymarket backtest."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -98,7 +98,7 @@ class PricePoint(BaseModel):
         """Parse timestamp from UNIX seconds."""
         if isinstance(v, datetime):
             return v
-        return datetime.fromtimestamp(int(v))
+        return datetime.fromtimestamp(int(v), tz=timezone.utc)
 
 
 class Snapshot(BaseModel):
