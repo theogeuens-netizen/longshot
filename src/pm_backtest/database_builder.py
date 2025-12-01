@@ -5,7 +5,9 @@ Converts cached Gamma and CLOB data into parquet files for fast backtesting.
 
 import asyncio
 import json
+import signal
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -15,6 +17,140 @@ from tqdm import tqdm
 
 from .clob_client import CLOBClient
 from .models import BacktestConfig
+
+
+class ProgressTracker:
+    """Track and persist database build progress."""
+
+    def __init__(self, db_dir: Path):
+        """Initialize progress tracker."""
+        self.db_dir = db_dir
+        self.progress_file = db_dir / "build_progress.json"
+        self.log_file = db_dir / "build_log.txt"
+        self.completed_market_ids = set()
+        self.total_markets = 0
+        self.start_time = None
+        self.interrupted = False
+
+    def load(self) -> bool:
+        """
+        Load existing progress file.
+
+        Returns:
+            True if progress file exists and was loaded, False otherwise
+        """
+        if not self.progress_file.exists():
+            return False
+
+        try:
+            with open(self.progress_file) as f:
+                data = json.load(f)
+
+            self.completed_market_ids = set(data.get("completed_market_ids", []))
+            self.total_markets = data.get("total_markets", 0)
+
+            if self.completed_market_ids:
+                self.log(
+                    f"Resuming build: {len(self.completed_market_ids)}/{self.total_markets} "
+                    f"markets already completed"
+                )
+                return True
+
+        except Exception as e:
+            self.log(f"⚠️  Failed to load progress file: {e}")
+
+        return False
+
+    def save(self) -> None:
+        """Save current progress to file."""
+        try:
+            data = {
+                "completed_market_ids": sorted(list(self.completed_market_ids)),
+                "last_updated": datetime.now().isoformat(),
+                "total_markets": self.total_markets,
+                "completed": len(self.completed_market_ids),
+            }
+
+            # Write atomically (write to temp file, then rename)
+            temp_file = self.progress_file.with_suffix(".json.tmp")
+            with open(temp_file, "w") as f:
+                json.dump(data, f, indent=2)
+
+            temp_file.replace(self.progress_file)
+
+        except Exception as e:
+            self.log(f"⚠️  Failed to save progress: {e}")
+
+    def log(self, message: str) -> None:
+        """
+        Write timestamped message to log file.
+
+        Args:
+            message: Log message
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_line = f"[{timestamp}] {message}\n"
+
+        # Print to console
+        print(message)
+
+        # Write to log file
+        try:
+            with open(self.log_file, "a") as f:
+                f.write(log_line)
+        except Exception:
+            pass
+
+    def mark_completed(self, market_id: str) -> None:
+        """Mark a market as completed."""
+        self.completed_market_ids.add(market_id)
+
+    def is_completed(self, market_id: str) -> bool:
+        """Check if a market is already completed."""
+        return market_id in self.completed_market_ids
+
+    def set_interrupted(self) -> None:
+        """Mark as interrupted by user."""
+        self.interrupted = True
+
+    def calculate_eta(self, completed: int) -> str:
+        """
+        Calculate estimated time remaining.
+
+        Args:
+            completed: Number of items completed so far
+
+        Returns:
+            Human-readable ETA string
+        """
+        if not self.start_time or completed == 0:
+            return "calculating..."
+
+        elapsed = time.time() - self.start_time
+        rate = completed / elapsed  # items per second
+        remaining = self.total_markets - completed
+
+        if rate > 0:
+            eta_seconds = remaining / rate
+
+            if eta_seconds < 60:
+                return f"{int(eta_seconds)}s"
+            elif eta_seconds < 3600:
+                return f"{int(eta_seconds / 60)}m"
+            else:
+                hours = int(eta_seconds / 3600)
+                minutes = int((eta_seconds % 3600) / 60)
+                return f"{hours}h {minutes}m"
+
+        return "unknown"
+
+    def clear(self) -> None:
+        """Clear progress file (use after successful completion)."""
+        try:
+            if self.progress_file.exists():
+                self.progress_file.unlink()
+        except Exception:
+            pass
 
 
 class DatabaseBuilder:
@@ -32,6 +168,8 @@ class DatabaseBuilder:
         self.clob_client = clob_client
         self.db_dir = Path("data/db")
         self.db_dir.mkdir(parents=True, exist_ok=True)
+        self.progress = ProgressTracker(self.db_dir)
+        self.save_interval = 100  # Save progress every N markets
 
     def load_cached_markets(self) -> list[dict]:
         """
@@ -201,6 +339,7 @@ class DatabaseBuilder:
         markets_df: pd.DataFrame,
         lookback_days_list: list[int],
         existing_snapshots_df: Optional[pd.DataFrame] = None,
+        resume: bool = True,
     ) -> pd.DataFrame:
         """
         Fetch price snapshots for all markets at multiple lookback periods.
@@ -209,13 +348,18 @@ class DatabaseBuilder:
             markets_df: DataFrame of markets
             lookback_days_list: List of lookback periods (e.g., [3, 7, 14, 30])
             existing_snapshots_df: Optional existing snapshots to skip duplicates
+            resume: Whether to resume from progress file
 
         Returns:
             DataFrame with columns: market_id, lookback_days, snapshot_time,
                                    yes_price, no_price
         """
-        print(f"📸 Fetching price snapshots for {len(markets_df)} markets...")
-        print(f"   Lookback periods: {lookback_days_list} days")
+        self.progress.log(f"📸 Fetching price snapshots for {len(markets_df)} markets...")
+        self.progress.log(f"   Lookback periods: {lookback_days_list} days")
+
+        # Load progress if resuming
+        if resume:
+            self.progress.load()
 
         # Track existing snapshots to avoid re-fetching
         existing_keys = set()
@@ -223,44 +367,113 @@ class DatabaseBuilder:
             for _, row in existing_snapshots_df.iterrows():
                 key = (row["market_id"], row["lookback_days"])
                 existing_keys.add(key)
-            print(f"   Skipping {len(existing_keys)} existing snapshots")
+            self.progress.log(f"   Skipping {len(existing_keys)} existing snapshots")
 
-        snapshots = []
-        tasks = []
+        # Check cache for available prices
+        cache_dir = Path("data/raw/prices")
+        cached_files = list(cache_dir.glob("*.json")) if cache_dir.exists() else []
+        self.progress.log(f"   Found {len(cached_files)} cached price files")
 
-        # Create tasks for all market-lookback combinations
+        # Build list of markets to process
+        markets_to_process = []
         for _, market_row in markets_df.iterrows():
-            for lookback_days in lookback_days_list:
-                # Skip if already exists
-                key = (market_row["market_id"], lookback_days)
-                if key in existing_keys:
-                    continue
+            market_id = market_row["market_id"]
 
-                task = self._fetch_market_snapshot(
-                    market_id=market_row["market_id"],
-                    clob_token_id=market_row["clob_token_id"],
-                    end_date=market_row["end_date"],
-                    lookback_days=lookback_days,
-                )
-                tasks.append(task)
+            # Skip if already completed (from progress file)
+            if self.progress.is_completed(market_id):
+                continue
 
-        if not tasks:
-            print("✓ All snapshots already exist in database\n")
+            markets_to_process.append(market_row)
+
+        if not markets_to_process:
+            self.progress.log("✓ All markets already processed\n")
             return pd.DataFrame()
 
-        print(f"   Fetching {len(tasks)} new snapshot(s)...\n")
+        # Set up progress tracking
+        self.progress.total_markets = len(markets_to_process)
+        self.progress.start_time = time.time()
+        self.progress.log(f"   Processing {len(markets_to_process)} remaining markets...\n")
 
-        # Execute with progress bar
-        with tqdm(total=len(tasks), desc="Fetching prices", unit=" snapshots") as pbar:
-            for coro in asyncio.as_completed(tasks):
-                snapshot = await coro
-                if snapshot:
-                    snapshots.append(snapshot)
+        # Set up signal handler for graceful interrupt
+        interrupted = False
+
+        def signal_handler(signum, frame):
+            nonlocal interrupted
+            interrupted = True
+            self.progress.set_interrupted()
+            self.progress.log("\n⚠️  Interrupt received, saving progress...")
+
+        signal.signal(signal.SIGINT, signal_handler)
+
+        snapshots = []
+        completed_count = len(self.progress.completed_market_ids)
+
+        # Process markets one at a time (to enable progress tracking per market)
+        with tqdm(
+            total=len(markets_to_process),
+            initial=0,
+            desc="Fetching prices",
+            unit=" markets",
+        ) as pbar:
+            for i, market_row in enumerate(markets_to_process):
+                if interrupted:
+                    break
+
+                market_id = market_row["market_id"]
+                clob_token_id = market_row["clob_token_id"]
+                end_date = market_row["end_date"]
+
+                # Fetch all lookback periods for this market
+                for lookback_days in lookback_days_list:
+                    if interrupted:
+                        break
+
+                    # Skip if already in database
+                    key = (market_id, lookback_days)
+                    if key in existing_keys:
+                        continue
+
+                    snapshot = await self._fetch_market_snapshot(
+                        market_id=market_id,
+                        clob_token_id=clob_token_id,
+                        end_date=end_date,
+                        lookback_days=lookback_days,
+                    )
+
+                    if snapshot:
+                        snapshots.append(snapshot)
+
+                # Mark market as completed
+                self.progress.mark_completed(market_id)
+                completed_count += 1
                 pbar.update(1)
 
-        df = pd.DataFrame(snapshots)
-        print(f"\n✓ Fetched {len(df)} new valid snapshots")
-        print(f"  ({len(tasks) - len(df)} had missing price data)\n")
+                # Save progress periodically
+                if completed_count % self.save_interval == 0:
+                    self.progress.save()
+                    eta = self.progress.calculate_eta(completed_count)
+                    self.progress.log(
+                        f"Progress: {completed_count}/{self.progress.total_markets} "
+                        f"({completed_count/self.progress.total_markets*100:.1f}%) - ETA: {eta}"
+                    )
+
+        # Final save
+        self.progress.save()
+
+        if interrupted:
+            self.progress.log(
+                f"\n⚠️  Build interrupted. Progress saved. "
+                f"Completed {completed_count}/{self.progress.total_markets} markets."
+            )
+            self.progress.log("   Run the same command again to resume.\n")
+            df = pd.DataFrame(snapshots) if snapshots else pd.DataFrame()
+            return df
+
+        df = pd.DataFrame(snapshots) if snapshots else pd.DataFrame()
+        self.progress.log(f"\n✓ Fetched {len(df)} new valid snapshots")
+        self.progress.log(
+            f"  ({len(markets_to_process) * len(lookback_days_list) - len(df)} had missing price data)\n"
+        )
 
         return df
 
@@ -403,6 +616,14 @@ async def build_database(
     async with CLOBClient(config) as clob_client:
         builder = DatabaseBuilder(config, clob_client)
 
+        # Initialize logging
+        builder.progress.log("Starting database build")
+        builder.progress.log(f"Lookback periods: {lookback_days_list}")
+        if start_date:
+            builder.progress.log(f"Start date filter: {start_date.date()}")
+        if end_date:
+            builder.progress.log(f"End date filter: {end_date.date()}")
+
         # Load existing database if incremental
         existing_markets_df = pd.DataFrame()
         existing_snapshots_df = pd.DataFrame()
@@ -414,14 +635,14 @@ async def build_database(
         raw_markets = builder.load_cached_markets()
 
         if not raw_markets:
-            print("❌ No cached markets found. Please run 'run-backtest' first to cache data.\n")
+            builder.progress.log("❌ No cached markets found. Please run 'run-backtest' first to cache data.\n")
             return
 
         # Filter and parse markets
         new_markets_df = builder.filter_and_parse_markets(raw_markets, start_date, end_date)
 
         if new_markets_df.empty:
-            print("❌ No markets match the filter criteria.\n")
+            builder.progress.log("❌ No markets match the filter criteria.\n")
             return
 
         # Merge with existing markets
@@ -430,19 +651,29 @@ async def build_database(
             existing_ids = set(existing_markets_df["market_id"])
             new_only = new_markets_df[~new_markets_df["market_id"].isin(existing_ids)]
 
-            print(f"   Found {len(new_only)} new markets to add")
-            print(f"   Keeping {len(existing_markets_df)} existing markets")
+            builder.progress.log(f"   Found {len(new_only)} new markets to add")
+            builder.progress.log(f"   Keeping {len(existing_markets_df)} existing markets")
 
             markets_df = pd.concat([existing_markets_df, new_only], ignore_index=True)
         else:
             markets_df = new_markets_df
 
-        # Fetch snapshots
+        # Fetch snapshots (this is where the long work happens)
+        markets_to_fetch = (
+            new_only if (not existing_markets_df.empty and incremental) else markets_df
+        )
+
         new_snapshots_df = await builder.fetch_snapshots_for_markets(
-            markets_df if not incremental else new_only if not existing_markets_df.empty else markets_df,
+            markets_to_fetch,
             lookback_days_list,
             existing_snapshots_df if incremental else None,
+            resume=True,
         )
+
+        # Check if interrupted
+        if builder.progress.interrupted:
+            builder.progress.log("Build interrupted. Progress saved for resume.\n")
+            return
 
         # Merge snapshots
         if not existing_snapshots_df.empty and not new_snapshots_df.empty:
@@ -455,19 +686,23 @@ async def build_database(
             snapshots_df = existing_snapshots_df
 
         if snapshots_df.empty:
-            print("❌ No snapshots available.\n")
+            builder.progress.log("❌ No snapshots available.\n")
             return
 
         # Save to parquet
         builder.save_to_parquet(markets_df, snapshots_df)
 
+        # Clear progress file on successful completion
+        builder.progress.clear()
+        builder.progress.log("✓ Progress file cleared")
+
         # Print summary
-        print("=" * 60)
-        print("📊 DATABASE SUMMARY")
-        print("=" * 60)
-        print(f"Markets:   {len(markets_df):,}")
-        print(f"Snapshots: {len(snapshots_df):,}")
-        print(f"Lookback periods: {lookback_days_list}")
-        print()
-        print("✅ Database build complete!")
-        print("   Use 'backtest' or 'sweep' commands to run fast backtests\n")
+        builder.progress.log("=" * 60)
+        builder.progress.log("📊 DATABASE SUMMARY")
+        builder.progress.log("=" * 60)
+        builder.progress.log(f"Markets:   {len(markets_df):,}")
+        builder.progress.log(f"Snapshots: {len(snapshots_df):,}")
+        builder.progress.log(f"Lookback periods: {lookback_days_list}")
+        builder.progress.log("")
+        builder.progress.log("✅ Database build complete!")
+        builder.progress.log("   Use 'backtest' or 'sweep' commands to run fast backtests\n")
