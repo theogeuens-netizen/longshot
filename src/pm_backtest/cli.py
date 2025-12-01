@@ -12,9 +12,13 @@ import pandas as pd
 
 from .clob_client import CLOBClient
 from .config import load_config
+from .database_builder import build_database
+from .fast_backtester import print_backtest_summary
+from .fast_backtester import run_backtest as run_fast_backtest
 from .gamma_client import GammaClient
 from .longshot_logic import LongshotBacktester
 from .models import BacktestSummary
+from .sweep_runner import run_sweep_from_file
 
 
 async def run_backtest(config_path: str = "config.yaml") -> None:
@@ -192,6 +196,126 @@ def export_results(trades, stats: dict, config, run_time: float) -> None:
     print(f"✓ Saved summary to {json_path}\n")
 
 
+async def build_db_command(
+    config_path: str = "config.yaml",
+    start_date: str = None,
+    end_date: str = None,
+) -> None:
+    """
+    Build or update the parquet database.
+
+    Args:
+        config_path: Path to configuration file
+        start_date: Optional start date (YYYY-MM-DD)
+        end_date: Optional end date (YYYY-MM-DD)
+    """
+    try:
+        config = load_config(config_path)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"❌ {e}\n", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse dates if provided
+    start_dt = datetime.fromisoformat(start_date) if start_date else None
+    end_dt = datetime.fromisoformat(end_date) if end_date else None
+
+    try:
+        await build_database(config, start_dt, end_dt)
+    except Exception as e:
+        print(f"\n❌ Failed to build database: {e}\n", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+def backtest_command(
+    lookback: int = 7,
+    longshot_min: float = 0.01,
+    longshot_max: float = 0.10,
+    min_volume: float = 5000,
+    fees_bps: int = 200,
+    slippage_bps: int = 100,
+    start_date: str = None,
+    end_date: str = None,
+) -> None:
+    """
+    Run a single fast backtest from parquet database.
+
+    Args:
+        lookback: Days before resolution to take snapshot
+        longshot_min: Minimum longshot probability
+        longshot_max: Maximum longshot probability
+        min_volume: Minimum market volume
+        fees_bps: Trading fees in basis points
+        slippage_bps: Slippage in basis points
+        start_date: Optional start date (YYYY-MM-DD)
+        end_date: Optional end date (YYYY-MM-DD)
+    """
+    # Load database
+    db_dir = Path("data/db")
+    markets_path = db_dir / "markets.parquet"
+    snapshots_path = db_dir / "snapshots.parquet"
+
+    if not markets_path.exists() or not snapshots_path.exists():
+        print("\n❌ Database not found. Run 'build-db' first.\n", file=sys.stderr)
+        sys.exit(1)
+
+    print("\n" + "=" * 60)
+    print("🎲 FAST BACKTEST")
+    print("=" * 60 + "\n")
+
+    print("📂 Loading database...")
+    markets_df = pd.read_parquet(markets_path)
+    snapshots_df = pd.read_parquet(snapshots_path)
+    print(f"   ✓ Loaded {len(markets_df)} markets and {len(snapshots_df)} snapshots\n")
+
+    # Run backtest
+    print("🔄 Running backtest...\n")
+    trades_df, result = run_fast_backtest(
+        markets_df=markets_df,
+        snapshots_df=snapshots_df,
+        lookback_days=lookback,
+        longshot_min=longshot_min,
+        longshot_max=longshot_max,
+        min_volume=min_volume,
+        fees_bps=fees_bps,
+        slippage_bps=slippage_bps,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    # Print results
+    print_backtest_summary(result)
+
+    # Save results
+    output_dir = Path("data/processed")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not trades_df.empty:
+        trades_path = output_dir / "fast_backtest_trades.csv"
+        trades_df.to_csv(trades_path, index=False)
+        print(f"💾 Saved trades to {trades_path}\n")
+
+
+def sweep_command(sweep_config: str) -> None:
+    """
+    Run a parameter sweep from YAML config.
+
+    Args:
+        sweep_config: Path to sweep YAML configuration file
+    """
+    try:
+        run_sweep_from_file(sweep_config)
+    except FileNotFoundError as e:
+        print(f"\n❌ {e}\n", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Failed to run sweep: {e}\n", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
 def main():
     """Main CLI entrypoint."""
     parser = argparse.ArgumentParser(
@@ -199,11 +323,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run backtest with default config
+  # Run backtest with default config (original slow method)
   python -m pm_backtest.cli run-backtest
 
-  # Run with custom config file
-  python -m pm_backtest.cli run-backtest --config my_config.yaml
+  # Build/update the parquet database
+  python -m pm_backtest.cli build-db
+  python -m pm_backtest.cli build-db --start 2025-04-01 --end 2025-11-01
+
+  # Run a single fast backtest
+  python -m pm_backtest.cli backtest --lookback 7 --longshot-min 0.01 --longshot-max 0.10
+
+  # Run a parameter sweep
+  python -m pm_backtest.cli sweep sweeps/my_sweep.yaml
 
 For more information, see README.md
         """,
@@ -211,14 +342,90 @@ For more information, see README.md
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
-    # run-backtest command
+    # run-backtest command (original, unchanged)
     backtest_parser = subparsers.add_parser(
-        "run-backtest", help="Run the longshot bias backtest"
+        "run-backtest", help="Run the longshot bias backtest (original slow method)"
     )
     backtest_parser.add_argument(
         "--config",
         default="config.yaml",
         help="Path to configuration file (default: config.yaml)",
+    )
+
+    # build-db command (new)
+    build_db_parser = subparsers.add_parser(
+        "build-db", help="Build or update the parquet database"
+    )
+    build_db_parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to configuration file (default: config.yaml)",
+    )
+    build_db_parser.add_argument(
+        "--start",
+        help="Start date (YYYY-MM-DD)",
+    )
+    build_db_parser.add_argument(
+        "--end",
+        help="End date (YYYY-MM-DD)",
+    )
+
+    # backtest command (new fast backtest)
+    fast_backtest_parser = subparsers.add_parser(
+        "backtest", help="Run a single fast backtest from parquet database"
+    )
+    fast_backtest_parser.add_argument(
+        "--lookback",
+        type=int,
+        default=7,
+        help="Days before resolution to take snapshot (default: 7)",
+    )
+    fast_backtest_parser.add_argument(
+        "--longshot-min",
+        type=float,
+        default=0.01,
+        help="Minimum longshot probability (default: 0.01)",
+    )
+    fast_backtest_parser.add_argument(
+        "--longshot-max",
+        type=float,
+        default=0.10,
+        help="Maximum longshot probability (default: 0.10)",
+    )
+    fast_backtest_parser.add_argument(
+        "--min-volume",
+        type=float,
+        default=5000,
+        help="Minimum market volume (default: 5000)",
+    )
+    fast_backtest_parser.add_argument(
+        "--fees-bps",
+        type=int,
+        default=200,
+        help="Trading fees in basis points (default: 200 = 2%%)",
+    )
+    fast_backtest_parser.add_argument(
+        "--slippage-bps",
+        type=int,
+        default=100,
+        help="Slippage in basis points (default: 100 = 1%%)",
+    )
+    fast_backtest_parser.add_argument(
+        "--start",
+        help="Start date (YYYY-MM-DD)",
+    )
+    fast_backtest_parser.add_argument(
+        "--end",
+        help="End date (YYYY-MM-DD)",
+    )
+
+    # sweep command (new)
+    sweep_parser = subparsers.add_parser(
+        "sweep", help="Run a parameter sweep from YAML config"
+    )
+    sweep_parser.add_argument(
+        "sweep_config",
+        help="Path to sweep YAML configuration file",
     )
 
     args = parser.parse_args()
@@ -235,6 +442,42 @@ For more information, see README.md
 
             traceback.print_exc()
             sys.exit(1)
+
+    elif args.command == "build-db":
+        try:
+            asyncio.run(build_db_command(args.config, args.start, args.end))
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Database build interrupted by user\n")
+            sys.exit(130)
+        except Exception as e:
+            print(f"\n❌ Unexpected error: {e}\n", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+
+    elif args.command == "backtest":
+        try:
+            backtest_command(
+                lookback=args.lookback,
+                longshot_min=args.longshot_min,
+                longshot_max=args.longshot_max,
+                min_volume=args.min_volume,
+                fees_bps=args.fees_bps,
+                slippage_bps=args.slippage_bps,
+                start_date=args.start,
+                end_date=args.end,
+            )
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Backtest interrupted by user\n")
+            sys.exit(130)
+
+    elif args.command == "sweep":
+        try:
+            sweep_command(args.sweep_config)
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Sweep interrupted by user\n")
+            sys.exit(130)
+
     else:
         parser.print_help()
 
