@@ -1,0 +1,19 @@
+name: "full_grid"
+description: "Comprehensive grid search across lookback periods and thresholds"
+
+date_range:
+  start: "2025-04-01"
+  end: "2025-11-01"
+
+fixed:
+  fees_bps: 200
+  slippage_bps: 100
+  min_volume: 5000
+
+vary:
+  lookback_days: [3, 7, 14, 30]
+  longshot_range:
+    - [0.01, 0.05]
+    - [0.01, 0.10]
+    - [0.05, 0.10]
+    - [0.05, 0.15]

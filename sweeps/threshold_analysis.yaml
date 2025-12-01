@@ -1,0 +1,21 @@
+name: "threshold_analysis"
+description: "Analyze performance across different longshot probability ranges"
+
+date_range:
+  start: "2025-04-01"
+  end: "2025-11-01"
+
+fixed:
+  fees_bps: 200
+  slippage_bps: 100
+  min_volume: 5000
+  lookback_days: 7
+
+vary:
+  longshot_range:
+    - [0.01, 0.05]   # 1-5% longshots (very extreme)
+    - [0.01, 0.10]   # 1-10% longshots (standard)
+    - [0.01, 0.15]   # 1-15% longshots (including moderate underdogs)
+    - [0.05, 0.10]   # 5-10% longshots (narrow range)
+    - [0.05, 0.15]   # 5-15% longshots (moderate underdogs only)
+    - [0.10, 0.20]   # 10-20% (weak underdogs)
