@@ -149,4 +149,111 @@ def merge_dune_gamma(dune_df: pd.DataFrame, gamma_df: pd.DataFrame) -> pd.DataFr
     gamma_df["condition_id"] = gamma_df["condition_id"].astype(str).str.lower()
 
     merged = dune_df.merge(
-        ga
+        gamma_df[["condition_id", "slug", "category", "volume", "liquidity"]],
+        on="condition_id",
+        how="left",
+    )
+    return merged
+
+
+# ---------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------
+
+def build_backtest_database(
+    query_id: int,
+    api_key: str,
+    gamma_dir: str | Path = "data/raw",
+    output_path: str | Path = "data/db/backtest_db.parquet",
+) -> pd.DataFrame:
+    """
+    End-to-end: Dune → Gamma → merged parquet.
+
+    Args:
+        query_id: Dune query id (e.g., 6284837)
+        api_key: your Dune API key (string)
+        gamma_dir: directory containing markets_*.json
+        output_path: parquet file to write
+
+    Returns:
+        merged DataFrame
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print("Building Backtest Database")
+    print("=" * 60)
+
+    print("\n[1/3] Fetching from Dune...")
+    dune_df = fetch_from_dune(query_id=query_id, api_key=api_key)
+    print(f"      {len(dune_df):,} markets with prices")
+
+    print("\n[2/3] Loading Gamma cache...")
+    gamma_df = load_gamma_cache(gamma_dir)
+    print(f"      {len(gamma_df):,} markets in cache")
+
+    print("\n[3/3] Merging datasets...")
+    merged = merge_dune_gamma(dune_df, gamma_df)
+    matched = merged["category"].notna().sum()
+    print(f"      {matched:,}/{len(merged):,} markets matched with Gamma metadata")
+
+    merged.to_parquet(output_path, index=False)
+    print(f"\n✓ Saved to {output_path}")
+
+    _print_summary(merged)
+    return merged
+
+
+def _print_summary(df: pd.DataFrame) -> None:
+    print("\n" + "=" * 60)
+    print("DATABASE SUMMARY")
+    print("=" * 60)
+
+    print(f"\nTotal markets: {len(df):,}")
+
+    if "winner" in df.columns:
+        print("\nBy winner:")
+        print(df["winner"].value_counts().to_string())
+
+    if "category" in df.columns and df["category"].notna().any():
+        print("\nBy category (top 10):")
+        print(df["category"].value_counts().head(10).to_string())
+    else:
+        print("\nBy category: (no category matched)")
+
+    print("\nPrice coverage:")
+    for col in sorted(c for c in df.columns if c.startswith("yes_price_")):
+        coverage = df[col].notna().sum()
+        pct = 100 * coverage / len(df)
+        print(f"  {col}: {coverage:,}/{len(df):,} ({pct:.1f}%)")
+
+    if "volume" in df.columns:
+        vol = df[df["volume"] > 0]["volume"]
+        if len(vol) > 0:
+            print("\nVolume stats:")
+            print(f"  Markets with volume: {len(vol):,}")
+            print(f"  Median: ${vol.median():,.0f}")
+            print(f"  Mean:   ${vol.mean():,.0f}")
+            print(f"  Max:    ${vol.max():,.0f}")
+
+
+# Optional CLI
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build Dune+Gamma backtest DB")
+    parser.add_argument("--query-id", "-q", type=int, required=True)
+    parser.add_argument("--api-key", "-k", type=str, required=True)
+    parser.add_argument("--gamma-dir", "-g", type=str, default="data/raw")
+    parser.add_argument(
+        "--output", "-o", type=str, default="data/db/backtest_db.parquet"
+    )
+    args = parser.parse_args()
+
+    build_backtest_database(
+        query_id=args.query_id,
+        api_key=args.api_key,
+        gamma_dir=args.gamma_dir,
+        output_path=args.output,
+    )
