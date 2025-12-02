@@ -20,6 +20,55 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
+def _normalize_dune_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize Dune output (dune_prices_*.parquet) to the schema expected by
+    the backtest converter.
+
+    - resolved_on_timestamp -> resolution_time
+    - outcome -> winner (YES/NO)
+    - price_*_before -> yes_price_* and no_price_* = 1 - yes_price_*
+    """
+    df = df.copy()
+
+    # 1) Map resolved_on_timestamp -> resolution_time if needed
+    if (
+        "resolved_on_timestamp" in df.columns
+        and "resolution_time" not in df.columns
+        and "end_date" not in df.columns
+    ):
+        df = df.rename(columns={"resolved_on_timestamp": "resolution_time"})
+
+    # 2) Map outcome -> winner (uppercased YES/NO)
+    if "winner" not in df.columns and "outcome" in df.columns:
+        df["winner"] = df["outcome"].astype(str).str.strip().str.upper()
+
+    # 3) Map price_*_before -> yes_price_* and synthesize no_price_*
+    rename_prices = {
+        "price_1h_before": "yes_price_1h",
+        "price_24h_before": "yes_price_1d",
+        "price_2d_before": "yes_price_2d",
+        "price_3d_before": "yes_price_3d",
+        "price_7d_before": "yes_price_7d",
+        "price_14d_before": "yes_price_14d",
+        "price_30d_before": "yes_price_30d",
+    }
+
+    # Only rename columns that actually exist
+    rename_prices = {k: v for k, v in rename_prices.items() if k in df.columns}
+    if rename_prices:
+        df = df.rename(columns=rename_prices)
+
+    # Create NO prices as 1 - YES price
+    yes_cols = [c for c in df.columns if c.startswith("yes_price_")]
+    for yes_col in yes_cols:
+        suffix = yes_col.replace("yes_price_", "")
+        no_col = f"no_price_{suffix}"
+        if no_col not in df.columns:
+            df[yes_col] = df[yes_col].astype(float)
+            df[no_col] = 1.0 - df[yes_col]
+
+    return df
 
 
 # Mapping from Dune column suffix to lookback_days
@@ -67,7 +116,8 @@ def convert_dune_to_backtest_format(
 
     print("📂 Loading Dune database...")
     df = pd.read_parquet(input_path)
-    print(f"   ✓ Loaded {len(df):,} markets\n")
+    df = _normalize_dune_schema(df)
+    print(f"   ✓ Loaded {len(df):,} markets after normalisation\n")
 
     # Show available columns
     print("📋 Available columns:")
@@ -91,8 +141,12 @@ def convert_dune_to_backtest_format(
         date_col = "resolution_time"
     elif "end_date" in df.columns:
         date_col = "end_date"
+    elif "resolved_on_timestamp" in df.columns:
+        date_col = "resolved_on_timestamp"
     else:
-        raise ValueError("No date column found (expected 'resolution_time' or 'end_date')")
+        raise ValueError(
+            "No date column found (expected 'resolution_time', 'end_date' or 'resolved_on_timestamp')"
+        )
 
     # Build markets dataframe
     market_cols = [id_col]
