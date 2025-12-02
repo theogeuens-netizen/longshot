@@ -77,8 +77,22 @@ def _normalize_dune_schema(df: pd.DataFrame) -> pd.DataFrame:
     for yes_col in yes_cols:
         suffix = yes_col.replace("yes_price_", "")
         no_col = f"no_price_{suffix}"
+
+        # Safely coerce strings like "<nil>" to NaN, then to float
+        df[yes_col] = pd.to_numeric(
+            df[yes_col].replace(
+                {
+                    "<nil>": None,
+                    "nil": None,
+                    "NaN": None,
+                    "nan": None,
+                }
+            ),
+            errors="coerce",     # anything weird -> NaN
+        )
+
+        # Only create NO prices if they don't already exist
         if no_col not in df.columns:
-            df[yes_col] = df[yes_col].astype(float)
             df[no_col] = 1.0 - df[yes_col]
 
     return df
