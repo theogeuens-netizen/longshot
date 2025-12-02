@@ -20,6 +20,20 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
+
+
+# Mapping from Dune column suffix to lookback_days
+LOOKBACK_MAP = {
+    "1h": None,   # Skip - not a full day
+    "1d": 1,
+    "2d": 2,
+    "3d": 3,
+    "7d": 7,
+    "14d": 14,
+    "30d": 30,
+}
+
+
 def _normalize_dune_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize Dune output (dune_prices_*.parquet) to the schema expected by
@@ -54,7 +68,6 @@ def _normalize_dune_schema(df: pd.DataFrame) -> pd.DataFrame:
         "price_30d_before": "yes_price_30d",
     }
 
-    # Only rename columns that actually exist
     rename_prices = {k: v for k, v in rename_prices.items() if k in df.columns}
     if rename_prices:
         df = df.rename(columns=rename_prices)
@@ -69,18 +82,6 @@ def _normalize_dune_schema(df: pd.DataFrame) -> pd.DataFrame:
             df[no_col] = 1.0 - df[yes_col]
 
     return df
-
-
-# Mapping from Dune column suffix to lookback_days
-LOOKBACK_MAP = {
-    "1h": None,   # Skip - not a full day
-    "1d": 1,
-    "2d": 2,
-    "3d": 3,
-    "7d": 7,
-    "14d": 14,
-    "30d": 30,
-}
 
 
 def convert_dune_to_backtest_format(
